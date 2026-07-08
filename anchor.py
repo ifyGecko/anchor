@@ -3,7 +3,6 @@
 
 Usage:
     anchor.py <image> --arch {arm,mips32,ppc32} --endian {le,be} [options]
-    anchor.py --self-test
 
 Strategies:
     strings  - correlate pointer values with string offsets
@@ -53,26 +52,12 @@ ARCH_PROLOGUE_MIN = 5
 # encodings (E2xxxxxx, E3xxxxxx, E4xxxxxx) from producing false base peaks.
 MAX_POINTER_FREQUENCY = 32
 
-# Self-test cases. Extend or edit freely.
-SELF_TEST_CASES = [
-    {"arch": "arm",    "endian": "le", "base": 0x08000000, "flavor": "cortexm"},
-    {"arch": "arm",    "endian": "le", "base": 0x10000000, "flavor": "cortexm"},
-    {"arch": "arm",    "endian": "le", "base": 0x20000000, "flavor": "cortexm"},
-    {"arch": "mips32", "endian": "be", "base": 0xBFC00000, "flavor": "generic"},
-    {"arch": "mips32", "endian": "le", "base": 0x80010000, "flavor": "generic"},
-    {"arch": "ppc32",  "endian": "be", "base": 0x00100000, "flavor": "generic"},
-]
-
 # ============================================================================
 
 import argparse
 import array
-import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -317,8 +302,7 @@ def rank(total: dict, top_n: int):
 # ---------------------------------------------------------------------------
 
 def print_report(image_path, image_size, arch, endian,
-                 min_base, max_base, align,
-                 ranked, per_strategy, explain):
+                 min_base, max_base, align, ranked, raw_strings):
     print("anchor - firmware base address finder")
     print("image  : %s (%d bytes)" % (image_path, image_size))
     print("arch   : %s / %s" % (arch, endian))
@@ -329,17 +313,13 @@ def print_report(image_path, image_size, arch, endian,
         print("consider widening --min / --max, lowering --align, or verifying arch/endian.")
         return
     print("top candidates:")
-    for i, (base, score) in enumerate(ranked, 1):
-        print("  %d. 0x%08x   score=%7.3f" % (i, base, score))
-        if explain:
-            s = per_strategy["strings"].get(base, 0.0)
-            r = per_strategy["selfref"].get(base, 0.0)
-            a = per_strategy["arch"].get(base, 0.0)
-            print("       strings=%.3f  selfref=%.3f  arch=%.3f" % (s, r, a))
+    for i, (base, _score) in enumerate(ranked, 1):
+        hits = int(raw_strings.get(base, 0))
+        print("  %d. 0x%08x   ptr hit count: %d" % (i, base, hits))
 
 
 # ---------------------------------------------------------------------------
-# Analysis entry point (used by main and self-test)
+# Analysis entry point
 # ---------------------------------------------------------------------------
 
 def analyze(image: Image, arch: str, min_base: int, max_base: int, align: int):
@@ -357,255 +337,7 @@ def analyze(image: Image, arch: str, min_base: int, max_base: int, align: int):
     n_arch    = normalize(raw_arch)
 
     total = combine(n_strings, n_selfref, n_arch)
-    per_strategy = {"strings": n_strings, "selfref": n_selfref, "arch": n_arch}
-    return total, per_strategy, {
-        "n_strings": len(string_offsets),
-        "n_ptrs": sum(ptr_counter.values()),
-        "n_unique_ptrs": len(ptr_counter),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Self-test: build baremetal blobs and validate
-# ---------------------------------------------------------------------------
-
-C_SOURCE_COMMON = r"""
-#include <stdint.h>
-
-const char s1[] = "anchor_test_alpha_bravo_charlie";
-const char s2[] = "anchor_test_delta_echo_foxtrot_golf";
-const char s3[] = "anchor_test_hotel_india_juliet_kilo";
-const char s4[] = "anchor_test_lima_mike_november_oscar";
-const char s5[] = "anchor_test_papa_quebec_romeo_sierra";
-const char s6[] = "anchor_test_tango_uniform_victor";
-const char s7[] = "anchor_test_whiskey_xray_yankee_zulu";
-const char s8[] = "anchor_test_the_quick_brown_fox_jumps";
-const char s9[] = "anchor_test_lorem_ipsum_dolor_sit_amet";
-const char s10[] = "anchor_test_consectetur_adipiscing_elit";
-
-const char * const string_table[] = {
-    s1, s2, s3, s4, s5, s6, s7, s8, s9, s10
-};
-
-int compute_a(int x) { return x * 2 + 1; }
-int compute_b(int x) { return compute_a(x) + 3; }
-int compute_c(int x) { return compute_b(x) * compute_a(x); }
-int compute_d(int x) { return compute_c(x) - compute_b(x); }
-int compute_e(int x) { return compute_d(x) + compute_a(x) * 5; }
-int compute_f(int x) { return compute_e(x) * 2 - compute_c(x); }
-int compute_g(int x) { return compute_f(x) + compute_d(x) - 7; }
-int compute_h(int x) { return compute_g(x) ^ compute_e(x); }
-
-typedef int (*fn_t)(int);
-const fn_t fn_table[] = {
-    compute_a, compute_b, compute_c, compute_d,
-    compute_e, compute_f, compute_g, compute_h
-};
-
-volatile int sink;
-
-int main_(void) {
-    int r = 0;
-    for (int i = 0; i < 32; i++) {
-        for (int j = 0; j < 8; j++) {
-            r += fn_table[j](i);
-        }
-        for (int j = 0; j < 10; j++) {
-            const char *p = string_table[j];
-            r += (int)(uintptr_t)p;
-        }
-    }
-    sink = r;
-    return r;
-}
-
-int _start(void) {
-    return main_();
-}
-"""
-
-C_SOURCE_ARM_VECTORS = r"""
-void nmi_handler(void)  { while (1) { } }
-void hf_handler(void)   { while (1) { } }
-
-extern int _start(void);
-
-__attribute__((section(".vectors"), used))
-void * const vectors[16] = {
-    (void*)0x20008000,
-    (void*)_start,
-    (void*)nmi_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-    (void*)hf_handler,
-};
-"""
-
-LINKER_SCRIPT_ARM = r"""
-ENTRY(_start)
-SECTIONS
-{
-    . = %#x;
-    .text : {
-        KEEP(*(.vectors))
-        *(.text*)
-        *(.rodata*)
-        *(.data*)
-        . = ALIGN(4);
-    }
-    /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) *(.ARM.*) *(.debug*) }
-}
-"""
-
-LINKER_SCRIPT_GENERIC = r"""
-ENTRY(_start)
-SECTIONS
-{
-    . = %#x;
-    .text : {
-        *(.text*)
-        *(.rodata*)
-        *(.data*)
-        *(.sdata*)
-        . = ALIGN(4);
-    }
-    /DISCARD/ : {
-        *(.comment) *(.note*) *(.eh_frame*) *(.debug*)
-        *(.MIPS.*) *(.reginfo) *(.mdebug*) *(.pdr) *(.gnu.attributes)
-    }
-}
-"""
-
-TOOLCHAINS = {
-    ("arm",    "le"): ("arm-none-eabi-gcc",    "arm-none-eabi-objcopy",
-                       ["-mcpu=cortex-m3", "-mthumb"], []),
-    ("arm",    "be"): ("arm-none-eabi-gcc",    "arm-none-eabi-objcopy",
-                       ["-mcpu=cortex-m3", "-mthumb", "-mbig-endian"], []),
-    ("mips32", "be"): ("mips-linux-gnu-gcc",   "mips-linux-gnu-objcopy",
-                       ["-mabi=32", "-EB"], ["-EB"]),
-    ("mips32", "le"): ("mipsel-linux-gnu-gcc", "mipsel-linux-gnu-objcopy",
-                       ["-mabi=32", "-EL"], ["-EL"]),
-    ("ppc32",  "be"): ("powerpc-linux-gnu-gcc","powerpc-linux-gnu-objcopy",
-                       ["-m32"], []),
-}
-
-
-def build_test_firmware(arch, endian, base, workdir):
-    """Build a raw baremetal firmware blob for (arch, endian) at load address base.
-    Returns (path, None) on success, (None, reason) on skip/fail."""
-    key = (arch, endian)
-    if key not in TOOLCHAINS:
-        return None, "no toolchain mapping for %s/%s" % (arch, endian)
-    gcc, objcopy, gcc_extra, ld_extra = TOOLCHAINS[key]
-    if not shutil.which(gcc):
-        return None, "missing %s" % gcc
-    if not shutil.which(objcopy):
-        return None, "missing %s" % objcopy
-
-    src = workdir / ("firmware_%s_%s_%08x.c" % (arch, endian, base))
-    ld = workdir / ("firmware_%s_%s_%08x.ld" % (arch, endian, base))
-    elf = workdir / ("firmware_%s_%s_%08x.elf" % (arch, endian, base))
-    bin_ = workdir / ("firmware_%s_%s_%08x.bin" % (arch, endian, base))
-
-    source = C_SOURCE_COMMON
-    if arch == "arm":
-        source = C_SOURCE_ARM_VECTORS + C_SOURCE_COMMON
-        ld_text = LINKER_SCRIPT_ARM % base
-    else:
-        ld_text = LINKER_SCRIPT_GENERIC % base
-
-    src.write_text(source)
-    ld.write_text(ld_text)
-
-    cmd = [gcc] + gcc_extra + [
-        "-Os", "-nostdlib", "-nostartfiles", "-ffreestanding",
-        "-fno-pic", "-fno-pie", "-fno-stack-protector",
-        "-fno-asynchronous-unwind-tables", "-fno-unwind-tables",
-        "-static",
-        "-Wl,--build-id=none", "-Wl,-no-pie",
-        "-T", str(ld),
-        str(src),
-        "-o", str(elf),
-    ]
-    # MIPS: avoid PIC/abicalls that break absolute addressing
-    if arch == "mips32":
-        cmd.insert(1, "-mno-abicalls")
-        cmd.insert(1, "-mno-shared")
-    # PPC uses libgcc helpers (_restgpr_*, _savegpr_*) for prologue/epilogue.
-    # Since we -nostdlib, link libgcc.a back in.
-    if arch == "ppc32":
-        r_lg = subprocess.run([gcc, "-print-libgcc-file-name"],
-                              capture_output=True)
-        if r_lg.returncode == 0:
-            libgcc = r_lg.stdout.decode().strip()
-            if libgcc:
-                cmd.append(libgcc)
-    r = subprocess.run(cmd, capture_output=True)
-    if r.returncode != 0:
-        return None, "compile failed: %s" % r.stderr.decode("utf-8", "replace").strip()
-
-    r = subprocess.run([objcopy, "-O", "binary", str(elf), str(bin_)],
-                       capture_output=True)
-    if r.returncode != 0:
-        return None, "objcopy failed: %s" % r.stderr.decode("utf-8", "replace").strip()
-
-    if not bin_.exists() or bin_.stat().st_size < 64:
-        return None, "output binary too small (%d bytes)" % (bin_.stat().st_size if bin_.exists() else 0)
-
-    return bin_, None
-
-
-def run_self_test():
-    print("anchor self-test")
-    print("-" * 60)
-    total = len(SELF_TEST_CASES)
-    passes = fails = skips = 0
-    with tempfile.TemporaryDirectory() as td:
-        wd = Path(td)
-        for i, case in enumerate(SELF_TEST_CASES, 1):
-            arch = case["arch"]
-            endian = case["endian"]
-            expected = case["base"]
-            print("[%d/%d] %s/%s  base=0x%08x  %s" %
-                  (i, total, arch, endian, expected, case["flavor"]))
-            path, reason = build_test_firmware(arch, endian, expected, wd)
-            if path is None:
-                print("        SKIP: %s" % reason)
-                skips += 1
-                print()
-                continue
-            data = path.read_bytes()
-            print("        built %s (%d bytes)" % (path.name, len(data)))
-            img = Image(data, endian)
-            lo, hi = ARCH_RANGES[arch]
-            total_scores, per_strategy, stats = analyze(img, arch, lo, hi, DEFAULT_ALIGN)
-            ranked = rank(total_scores, DEFAULT_TOP_N)
-            top_bases = [b for b, _ in ranked]
-            listed = "  ".join("0x%08x" % b for b in top_bases) if top_bases else "(none)"
-            print("        top-%d: %s" % (DEFAULT_TOP_N, listed))
-            if expected in top_bases:
-                rank_pos = top_bases.index(expected) + 1
-                print("        PASS: correct base at rank #%d" % rank_pos)
-                passes += 1
-            else:
-                print("        FAIL: correct base 0x%08x not in top-%d" %
-                      (expected, DEFAULT_TOP_N))
-                fails += 1
-            print()
-    print("-" * 60)
-    print("summary: %d pass, %d fail, %d skip (of %d)" %
-          (passes, fails, skips, total))
-    return 0 if fails == 0 else 1
+    return total, raw_strings
 
 
 # ---------------------------------------------------------------------------
@@ -622,11 +354,11 @@ def main(argv=None):
         description="firmware base address finder for raw embedded images",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("image", nargs="?", help="raw firmware image")
+    ap.add_argument("image", help="raw firmware image")
     ap.add_argument("--arch", choices=sorted(ARCH_RANGES.keys()),
-                    help="target architecture (required unless --self-test)")
+                    required=True, help="target architecture")
     ap.add_argument("--endian", choices=["le", "be"],
-                    help="target endianness (required unless --self-test)")
+                    required=True, help="target endianness")
     ap.add_argument("--min", dest="min_base", type=parse_int,
                     help="minimum candidate base (default: per-arch)")
     ap.add_argument("--max", dest="max_base", type=parse_int,
@@ -639,25 +371,8 @@ def main(argv=None):
                     help="size of region to analyze (default: to end)")
     ap.add_argument("--top", type=int, default=DEFAULT_TOP_N,
                     help="number of candidates to print (default: %d)" % DEFAULT_TOP_N)
-    ap.add_argument("--explain", action="store_true",
-                    help="show per-strategy contribution for each candidate")
-    ap.add_argument("--self-test", action="store_true",
-                    help="build baremetal test firmware images and validate anchor")
 
     args = ap.parse_args(argv)
-
-    if args.self_test:
-        return run_self_test()
-
-    if not args.image:
-        print("error: image path required (or use --self-test)")
-        return 2
-    if not args.arch:
-        print("error: --arch is required")
-        return 2
-    if not args.endian:
-        print("error: --endian is required")
-        return 2
 
     path = Path(args.image)
     if not path.exists():
@@ -688,13 +403,12 @@ def main(argv=None):
         max_base = max_base & ~align_mask
 
     img = Image(data, args.endian)
-    total_scores, per_strategy, stats = analyze(
+    total_scores, raw_strings = analyze(
         img, args.arch, min_base, max_base, args.align)
     ranked = rank(total_scores, args.top)
 
     print_report(str(path), len(data), args.arch, args.endian,
-                 min_base, max_base, args.align,
-                 ranked, per_strategy, args.explain)
+                 min_base, max_base, args.align, ranked, raw_strings)
 
     return 0 if ranked else 1
 
